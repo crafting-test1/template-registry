@@ -3,7 +3,7 @@ workspaces:
   - name: app
     ports:
       - name: http
-        port: 3000
+        port: 3100
         protocol: HTTP/TCP
     checkouts:
       - path: src/app
