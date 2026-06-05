@@ -1,0 +1,205 @@
+name: Validate Crafting Templates
+
+# Drop-in workflow: validates changed Crafting Template YAMLs in a PR and posts a
+# sticky preview comment describing what will happen on merge (create/update/remove).
+#
+# Setup (in the repo that holds your templates):
+#   - Secret   CS_LOGIN_TOKEN  : a Crafting service-account login token
+#   - Variable CS_SERVER_URL    : e.g. https://your-org.sandboxes.site
+#   - Variable CS_DOWNLOAD_URL  : (optional) override for the cs CLI download base
+#   - Variable CS_ORG           : (optional) target org, only needed for multi-org accounts
+#
+# Note: secrets are NOT available to pull_requests from forks, so validation runs
+# only for branches pushed to this repository (same-repo PRs).
+
+on:
+  pull_request:
+    paths:
+      - 'templates/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  TEMPLATES_DIR: templates
+  CS_SERVER_URL: ${{ vars.CS_SERVER_URL }}
+  CS_DOWNLOAD_URL: ${{ vars.CS_DOWNLOAD_URL }}
+  CS_ORG: ${{ vars.CS_ORG }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Guard - server URL configured
+        run: |
+          set -euo pipefail
+          if [ -z "${CS_SERVER_URL:-}" ]; then
+            echo "::error::CS_SERVER_URL is not set. Add it as a repository variable."
+            exit 1
+          fi
+
+      - name: Install cs CLI
+        run: |
+          set -euo pipefail
+
+          osarch="linux-amd64"
+          case "$(uname -m)" in
+            x86_64) osarch="linux-amd64" ;;
+            aarch64|arm64) osarch="linux-arm64" ;;
+          esac
+
+          bases=()
+          [ -n "${CS_DOWNLOAD_URL:-}" ] && bases+=("${CS_DOWNLOAD_URL%/}")
+          [ -n "${CS_SERVER_URL:-}" ]   && bases+=("${CS_SERVER_URL%/}/download")
+          bases+=("https://storage.googleapis.com/cloud-sandboxes")
+
+          tmp="$(mktemp -d)"
+          base=""
+          for b in "${bases[@]}"; do
+            cand="${b%/}/cs"
+            echo "Trying ${cand}/version.json"
+            if curl -fsSL "${cand}/version.json" -o "$tmp/version.json"; then
+              base="$cand"; break
+            fi
+          done
+          if [ -z "$base" ]; then
+            echo "::error::Could not fetch cs version manifest from any source."
+            exit 1
+          fi
+
+          url="$(jq -r '.url // empty' "$tmp/version.json")"
+          folder="$(jq -r '.folder // empty' "$tmp/version.json")"
+          [ -n "$url" ] || url="$base"
+          url="${url%/}"
+          dl="$url"
+          if [ -n "$folder" ]; then
+            folder="${folder#/}"; folder="${folder%/}"
+            dl="$url/$folder"
+          fi
+
+          tgz="cs-${osarch}.tar.gz"
+          echo "Downloading ${dl}/${tgz}"
+          curl -fsSL "${dl}/${tgz}" -o "$tmp/${tgz}"
+          if curl -fsSL "${dl}/${tgz}.sha256sum" -o "$tmp/${tgz}.sha256sum"; then
+            expected="$(awk '{print $1}' "$tmp/${tgz}.sha256sum")"
+            actual="$(sha256sum "$tmp/${tgz}" | awk '{print $1}')"
+            if [ "$expected" != "$actual" ]; then
+              echo "::error::cs checksum mismatch (expected ${expected}, got ${actual})"
+              exit 1
+            fi
+          fi
+
+          mkdir -p "$HOME/.cs-bin"
+          tar -C "$HOME/.cs-bin" -xzf "$tmp/${tgz}"
+          bin="$(find "$HOME/.cs-bin" -type f -name cs | head -n1)"
+          if [ -z "$bin" ]; then
+            echo "::error::cs binary not found after unpack"
+            exit 1
+          fi
+          chmod +x "$bin"
+          dirname "$bin" >> "$GITHUB_PATH"
+
+      - name: Authenticate cs
+        env:
+          CS_LOGIN_TOKEN: ${{ secrets.CS_LOGIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CS_LOGIN_TOKEN:-}" ]; then
+            echo "::error::CS_LOGIN_TOKEN secret is not set (or unavailable on fork PRs)."
+            exit 1
+          fi
+          cs config set server_url "$CS_SERVER_URL"
+          cs login -t "$CS_LOGIN_TOKEN" >/dev/null
+          echo "Authenticated to ${CS_SERVER_URL}"
+
+      - name: Validate changed templates and post preview
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          org_flag=()
+          [ -n "${CS_ORG:-}" ] && org_flag=(-O "$CS_ORG")
+
+          git fetch --no-tags origin "$GITHUB_BASE_REF" >/dev/null 2>&1 || true
+          base_sha="$(git merge-base "origin/${GITHUB_BASE_REF}" HEAD)"
+          echo "Diffing ${base_sha}..HEAD under ${TEMPLATES_DIR}/"
+
+          marker="<!-- cs-templates-preview -->"
+          body="$(mktemp)"
+          {
+            echo "$marker"
+            echo "### Crafting Templates - merge preview"
+            echo ""
+            echo "| Action | Template | File | Validation |"
+            echo "| --- | --- | --- | --- |"
+          } > "$body"
+
+          failed=0
+          changes=0
+
+          template_name() {
+            local n; n="$(basename "$1")"; n="${n%.yaml}"; n="${n%.yml}"; printf '%s' "$n"
+          }
+
+          while IFS=$'\t' read -r status f1 f2; do
+            [ -n "$status" ] || continue
+            code="${status:0:1}"
+            action=""; file=""; name=""; validation="n/a"
+            case "$code" in
+              A) action="create"; file="$f1" ;;
+              M) action="update"; file="$f1" ;;
+              D) action="remove"; file="$f1" ;;
+              R) action="recreate"; file="$f2" ;;
+              C) action="create"; file="$f2" ;;
+              *) continue ;;
+            esac
+            [ -n "$file" ] || continue
+            name="$(template_name "$file")"
+            changes=$((changes + 1))
+
+            if [ "$action" != "remove" ]; then
+              if out="$(cs "${org_flag[@]}" template validate "$file" 2>&1)"; then
+                validation="passed"
+              else
+                validation="FAILED"
+                failed=1
+                echo "::error file=${file}::Validation failed for ${file}"
+                echo "$out"
+              fi
+            fi
+            echo "| ${action} | \`${name}\` | \`${file}\` | ${validation} |" >> "$body"
+          done < <(git diff --name-status --diff-filter=ACMRD "$base_sha" HEAD -- "$TEMPLATES_DIR")
+
+          if [ "$changes" -eq 0 ]; then
+            {
+              echo "$marker"
+              echo "### Crafting Templates - merge preview"
+              echo ""
+              echo "_No template changes detected under \`${TEMPLATES_DIR}/\`._"
+            } > "$body"
+          else
+            {
+              echo ""
+              if [ "$failed" -eq 0 ]; then
+                echo "All changed templates validated successfully. On merge, the actions above will be applied."
+              else
+                echo "One or more templates failed validation. Fix them before merging."
+              fi
+            } >> "$body"
+          fi
+
+          if ! gh pr comment "$PR_NUMBER" --edit-last --body-file "$body" 2>/dev/null; then
+            gh pr comment "$PR_NUMBER" --body-file "$body"
+          fi
+
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi

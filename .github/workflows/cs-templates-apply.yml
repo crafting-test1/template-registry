@@ -1,0 +1,204 @@
+name: Apply Crafting Templates
+
+# Drop-in workflow: on push to the default branch, applies template changes to
+# Crafting via the cs CLI - create (added), update (modified), remove (deleted),
+# recreate (renamed). One template per file under templates/<name>.yaml; the file
+# name (without extension) is the Template name.
+#
+# Setup (in the repo that holds your templates):
+#   - Secret   CS_LOGIN_TOKEN  : a Crafting service-account login token
+#   - Variable CS_SERVER_URL    : e.g. https://your-org.sandboxes.site
+#   - Variable CS_DOWNLOAD_URL  : (optional) override for the cs CLI download base
+#   - Variable CS_ORG           : (optional) target org, only needed for multi-org accounts
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'templates/**'
+
+permissions:
+  contents: read
+
+env:
+  TEMPLATES_DIR: templates
+  CS_SERVER_URL: ${{ vars.CS_SERVER_URL }}
+  CS_DOWNLOAD_URL: ${{ vars.CS_DOWNLOAD_URL }}
+  CS_ORG: ${{ vars.CS_ORG }}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Guard - server URL configured
+        run: |
+          set -euo pipefail
+          if [ -z "${CS_SERVER_URL:-}" ]; then
+            echo "::error::CS_SERVER_URL is not set. Add it as a repository variable."
+            exit 1
+          fi
+
+      - name: Install cs CLI
+        run: |
+          set -euo pipefail
+
+          osarch="linux-amd64"
+          case "$(uname -m)" in
+            x86_64) osarch="linux-amd64" ;;
+            aarch64|arm64) osarch="linux-arm64" ;;
+          esac
+
+          bases=()
+          [ -n "${CS_DOWNLOAD_URL:-}" ] && bases+=("${CS_DOWNLOAD_URL%/}")
+          [ -n "${CS_SERVER_URL:-}" ]   && bases+=("${CS_SERVER_URL%/}/download")
+          bases+=("https://storage.googleapis.com/cloud-sandboxes")
+
+          tmp="$(mktemp -d)"
+          base=""
+          for b in "${bases[@]}"; do
+            cand="${b%/}/cs"
+            echo "Trying ${cand}/version.json"
+            if curl -fsSL "${cand}/version.json" -o "$tmp/version.json"; then
+              base="$cand"; break
+            fi
+          done
+          if [ -z "$base" ]; then
+            echo "::error::Could not fetch cs version manifest from any source."
+            exit 1
+          fi
+
+          url="$(jq -r '.url // empty' "$tmp/version.json")"
+          folder="$(jq -r '.folder // empty' "$tmp/version.json")"
+          [ -n "$url" ] || url="$base"
+          url="${url%/}"
+          dl="$url"
+          if [ -n "$folder" ]; then
+            folder="${folder#/}"; folder="${folder%/}"
+            dl="$url/$folder"
+          fi
+
+          tgz="cs-${osarch}.tar.gz"
+          echo "Downloading ${dl}/${tgz}"
+          curl -fsSL "${dl}/${tgz}" -o "$tmp/${tgz}"
+          if curl -fsSL "${dl}/${tgz}.sha256sum" -o "$tmp/${tgz}.sha256sum"; then
+            expected="$(awk '{print $1}' "$tmp/${tgz}.sha256sum")"
+            actual="$(sha256sum "$tmp/${tgz}" | awk '{print $1}')"
+            if [ "$expected" != "$actual" ]; then
+              echo "::error::cs checksum mismatch (expected ${expected}, got ${actual})"
+              exit 1
+            fi
+          fi
+
+          mkdir -p "$HOME/.cs-bin"
+          tar -C "$HOME/.cs-bin" -xzf "$tmp/${tgz}"
+          bin="$(find "$HOME/.cs-bin" -type f -name cs | head -n1)"
+          if [ -z "$bin" ]; then
+            echo "::error::cs binary not found after unpack"
+            exit 1
+          fi
+          chmod +x "$bin"
+          dirname "$bin" >> "$GITHUB_PATH"
+
+      - name: Authenticate cs
+        env:
+          CS_LOGIN_TOKEN: ${{ secrets.CS_LOGIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CS_LOGIN_TOKEN:-}" ]; then
+            echo "::error::CS_LOGIN_TOKEN secret is not set."
+            exit 1
+          fi
+          cs config set server_url "$CS_SERVER_URL"
+          cs login -t "$CS_LOGIN_TOKEN" >/dev/null
+          echo "Authenticated to ${CS_SERVER_URL}"
+
+      - name: Apply template changes
+        run: |
+          set -euo pipefail
+
+          org_flag=()
+          [ -n "${CS_ORG:-}" ] && org_flag=(-O "$CS_ORG")
+
+          before="${{ github.event.before }}"
+          if [ -z "$before" ] || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            before="$(git hash-object -t tree /dev/null)"
+            echo "No valid 'before' commit; treating all template files as added."
+          fi
+          echo "Diffing ${before}..${GITHUB_SHA} under ${TEMPLATES_DIR}/"
+
+          template_name() {
+            local n; n="$(basename "$1")"; n="${n%.yaml}"; n="${n%.yml}"; printf '%s' "$n"
+          }
+
+          create_or_update() {
+            local name="$1" file="$2"
+            if cs "${org_flag[@]}" template create "$name" "$file"; then
+              echo "created ${name}"
+            else
+              echo "create failed for ${name}; attempting update"
+              cs "${org_flag[@]}" template update "$name" "$file"
+              echo "updated ${name}"
+            fi
+          }
+
+          update_or_create() {
+            local name="$1" file="$2"
+            if cs "${org_flag[@]}" template update "$name" "$file"; then
+              echo "updated ${name}"
+            else
+              echo "update failed for ${name}; attempting create"
+              cs "${org_flag[@]}" template create "$name" "$file"
+              echo "created ${name}"
+            fi
+          }
+
+          remove_template() {
+            local name="$1"
+            if cs "${org_flag[@]}" template remove "$name" --force; then
+              echo "removed ${name}"
+            else
+              echo "remove failed or template ${name} did not exist; continuing"
+            fi
+          }
+
+          applied=0
+          while IFS=$'\t' read -r status f1 f2; do
+            [ -n "$status" ] || continue
+            code="${status:0:1}"
+            case "$code" in
+              A|C)
+                file="${f2:-$f1}"
+                name="$(template_name "$file")"
+                create_or_update "$name" "$file"
+                applied=$((applied + 1))
+                ;;
+              M)
+                name="$(template_name "$f1")"
+                update_or_create "$name" "$f1"
+                applied=$((applied + 1))
+                ;;
+              D)
+                name="$(template_name "$f1")"
+                remove_template "$name"
+                applied=$((applied + 1))
+                ;;
+              R)
+                old_name="$(template_name "$f1")"
+                new_name="$(template_name "$f2")"
+                if [ "$old_name" != "$new_name" ]; then
+                  remove_template "$old_name"
+                fi
+                create_or_update "$new_name" "$f2"
+                applied=$((applied + 1))
+                ;;
+              *) ;;
+            esac
+          done < <(git diff --name-status --diff-filter=ACMRD "$before" "$GITHUB_SHA" -- "$TEMPLATES_DIR")
+
+          echo "Applied ${applied} template change(s)."
