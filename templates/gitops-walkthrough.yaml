@@ -3,7 +3,7 @@ workspaces:
   - name: api
     ports:
       - name: http
-        port: 8000
+        port: 8090
         protocol: HTTP/TCP
     checkouts:
       - path: src/api
