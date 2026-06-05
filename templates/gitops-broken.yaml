@@ -1,0 +1,5 @@
+# Intentionally invalid template for the walkthrough failure demo.
+workspaces:
+  name: broken
+  port: not-a-number
+unknown_field: true
