@@ -1,4 +1,0 @@
-# Intentionally invalid: 'workspaces' must be a list, and bogus_field is unknown.
-workspaces:
-  name: oops
-bogus_field: true
