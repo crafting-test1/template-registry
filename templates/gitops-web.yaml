@@ -1,0 +1,20 @@
+# Template name = "gitops-web"
+workspaces:
+  - name: web
+    ports:
+      - name: http
+        port: 8080
+        protocol: HTTP/TCP
+    checkouts:
+      - path: src/web
+        repo:
+          git: https://github.com/crafting-test1/hello
+
+endpoints:
+  - name: web
+    http:
+      routes:
+        - path_prefix: /
+          backend:
+            target: web
+            port: http
